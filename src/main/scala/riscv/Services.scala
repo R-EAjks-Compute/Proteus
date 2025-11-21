@@ -2,6 +2,7 @@ package riscv
 
 import spinal.core._
 import spinal.lib._
+import riscv.plugins.memory.Metadata
 
 trait MemoryService {
 
@@ -138,8 +139,16 @@ object LsuOperationType extends SpinalEnum {
   val NONE, LOAD, STORE = newElement()
 }
 
-object LsuAccessWidth extends SpinalEnum {
-  val B, H, W, D = newElement() // TODO: this could mess with memory disambiguation predictors
+object LsuAccessWidth extends SpinalEnum(defaultEncoding = binarySequential) {
+  val B, H, W, D, Q = newElement() // TODO: this could mess with memory disambiguation predictors
+
+  def getBitWidth(width: SpinalEnumElement[this.type]): Int = (1 << width.position + 3)
+  // note: below are helpers for hardware values
+  // binarySequential encoding makes UInt representation p2 width
+  def getP2Width(width: SpinalEnumCraft[this.type]) = width.asBits.asUInt.resized
+  def getByteWidth(width: SpinalEnumCraft[this.type]) = (U(1) << this.getP2Width(width))
+  def getAlignmentMask(width: SpinalEnumCraft[this.type]) = (this.getByteWidth(width) - U(1))
+  def getByteMask(width: SpinalEnumCraft[this.type]) = (U(1) << this.getByteWidth(width)) - U(1)
 }
 
 trait LsuAddressTranslator {
@@ -181,6 +190,28 @@ trait LsuService {
       unsigned: Boolean
   ): Unit
 
+  trait LoadHandler {
+    def build(stage: Stage, address: UInt, dbusRsp: MemBusRsp): Unit
+  }
+
+  trait StoreHandler {
+    def build(stage: Stage, address: UInt): UInt
+  }
+
+  def addLoad(
+      opcode: MaskedLiteral,
+      dataHandler: LoadHandler,
+      width: SpinalEnumElement[LsuAccessWidth.type],
+      useExternalAddress: Boolean = false
+  ): Unit
+
+  def addStore(
+      opcode: MaskedLiteral,
+      dataHandler: StoreHandler,
+      width: SpinalEnumElement[LsuAccessWidth.type],
+      useExternalAddress: Boolean = false
+  ): Unit
+
   /** Set the address used by custom loads/stores.
     *
     * Must be called in the context of [[stage]].
@@ -189,6 +220,8 @@ trait LsuService {
     *   [[addStore]]
     */
   def setAddress(address: UInt): Unit
+
+  def setExternalStoreData(data: UInt): Unit
 
   /** The [[Stage]] of the LSU.
     */
@@ -233,6 +266,9 @@ trait LsuService {
   def widthOut(stage: Stage): SpinalEnumCraft[LsuAccessWidth.type]
 
   def psfMisspeculationRegister: PipelineData[Data]
+
+  var storeMetadata: Bundle with DynBundleAccess[Metadata]
+
 }
 
 trait ScheduleService {

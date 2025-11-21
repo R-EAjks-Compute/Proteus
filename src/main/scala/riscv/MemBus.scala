@@ -4,15 +4,25 @@ import spinal.core._
 import spinal.lib._
 import spinal.lib.bus.amba3.apb._
 import spinal.lib.bus.amba4.axi._
+import riscv.plugins.memory.Metadata
+import riscv.plugins.memory.MetadataProvider
 
 case class MemBusConfig(
     addressWidth: Int,
     idWidth: Int,
     dataWidth: Int,
-    readWrite: Boolean = true
+    readWrite: Boolean = true,
+    metadataProviders: Seq[MetadataProvider] = Seq()
 ) {
   def byte2WordAddress(ba: UInt): UInt = ba(dataWidth - 1 downto log2Up(dataWidth / 8))
   def word2ByteAddress(wa: UInt): UInt = wa << log2Up(dataWidth / 8)
+  def createMetadataBundle(): Bundle with DynBundleAccess[Metadata] = {
+    var dynBundle = new DynBundle[Metadata]
+    metadataProviders.foreach(provider =>
+      dynBundle.addElement(provider.getKey, provider.getHardType)
+    )
+    dynBundle.createBundle
+  }
 }
 
 case class MemBusCmd(config: MemBusConfig) extends Bundle {
@@ -21,11 +31,13 @@ case class MemBusCmd(config: MemBusConfig) extends Bundle {
   val write = if (config.readWrite) Bool() else null
   val wdata = if (config.readWrite) UInt(config.dataWidth bits) else null
   val wmask = if (config.readWrite) Bits(config.dataWidth / 8 bits) else null
+  val metadata = if (config.readWrite) config.createMetadataBundle else null
 }
 
 case class MemBusRsp(config: MemBusConfig) extends Bundle {
   val rdata = UInt(config.dataWidth bits)
   val id = UInt(config.idWidth bits)
+  val metadata = config.createMetadataBundle
 }
 
 case class MemBus(val config: MemBusConfig) extends Bundle with IMasterSlave {
@@ -182,6 +194,7 @@ class MemBusControl(bus: MemBus)(implicit config: Config) extends Area {
     bus.cmd.write := currentCmd.cmd.write
     bus.cmd.wdata := currentCmd.cmd.wdata
     bus.cmd.wmask := currentCmd.cmd.wmask
+    bus.cmd.metadata := currentCmd.cmd.metadata
   }
 
   bus.rsp.ready := True
@@ -200,7 +213,8 @@ class MemBusControl(bus: MemBus)(implicit config: Config) extends Area {
       address: UInt,
       write: Boolean = false,
       wdata: UInt = null,
-      wmask: Bits = null
+      wmask: Bits = null,
+      metadata: Bundle with DynBundleAccess[Metadata] = null
   ) = {
     assert(!write || bus.config.readWrite)
 
@@ -221,9 +235,11 @@ class MemBusControl(bus: MemBus)(implicit config: Config) extends Area {
         currentCmd.cmd.write := True
         currentCmd.cmd.wdata := wdata
         currentCmd.cmd.wmask := wmask
+        currentCmd.cmd.metadata := metadata
         bus.cmd.write := True
         bus.cmd.wdata := wdata
         bus.cmd.wmask := wmask
+        bus.cmd.metadata := metadata
       } else {
         currentCmd.cmd.write := False
         bus.cmd.write := False
@@ -269,7 +285,12 @@ class MemBusControl(bus: MemBus)(implicit config: Config) extends Area {
     (valid, rdata)
   }
 
-  def write(address: UInt, wdata: UInt, wmask: Bits): Bool = {
+  def write(
+      address: UInt,
+      wdata: UInt,
+      wmask: Bits,
+      metadata: Bundle with DynBundleAccess[Metadata]
+  ): Bool = {
     assert(bus.config.readWrite)
 
     val accepted = False
@@ -277,7 +298,7 @@ class MemBusControl(bus: MemBus)(implicit config: Config) extends Area {
     val issuedThisCycle = False
 
     when(!currentCmd.isIssued) {
-      issueCommand(address, write = true, wdata, wmask)
+      issueCommand(address, write = true, wdata, wmask, metadata)
       issuedThisCycle := True
     } elsewhen (currentCmd.cmd.address =/= address) {
       dropRsp := True

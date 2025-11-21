@@ -92,4 +92,5 @@ abstract class MemoryBackbone(implicit config: Config) extends Plugin with Memor
   override def observeDBus(observer: MemBusObserver): Unit = {
     dbusObservers += observer
   }
+
 }

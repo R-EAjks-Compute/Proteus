@@ -1,6 +1,8 @@
 package riscv
 
 import spinal.core.log2Up
+import spinal.core.Data
+import riscv.plugins.memory.MetadataProvider
 
 sealed trait BaseIsa {
   val xlen: Int
@@ -40,6 +42,8 @@ class Config(val baseIsa: BaseIsa, val debug: Boolean = true, val stlSpec: Boole
 
   def addressBasedSsb: Boolean = true
 
+  var dbusMetadataProviders: Seq[MetadataProvider] = Seq()
+
   def ibusConfig = MemBusConfig(
     addressWidth = baseIsa.xlen,
     idWidth = 2,
@@ -50,11 +54,13 @@ class Config(val baseIsa: BaseIsa, val debug: Boolean = true, val stlSpec: Boole
     addressWidth = baseIsa.xlen,
     idWidth = log2Up(parallelLoads + 1),
     dataWidth = memBusWidth,
-    readWrite = false
+    readWrite = false,
+    metadataProviders = dbusMetadataProviders
   )
   def dbusConfig = MemBusConfig(
     addressWidth = baseIsa.xlen,
     idWidth = log2Up(parallelLoads + 1),
-    dataWidth = memBusWidth
+    dataWidth = memBusWidth,
+    metadataProviders = dbusMetadataProviders
   )
 }

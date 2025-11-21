@@ -2,6 +2,7 @@ package riscv.plugins.memory
 
 import riscv._
 import spinal.core._
+import collection.mutable.LinkedHashSet
 
 class Lsu(addressStages: Set[Stage], loadStages: Seq[Stage], storeStage: Stage)
     extends Plugin[Pipeline]
@@ -19,18 +20,100 @@ class Lsu(addressStages: Set[Stage], loadStages: Seq[Stage], storeStage: Stage)
 
   private var addressTranslatorChanged = false
   private var externalAddress: UInt = _
+  private var externalStoreData: UInt = _
+  var storeMetadata: Bundle with DynBundleAccess[Metadata] = _
   private var hasExternalOps = false
+
+  private object DefaultLoadHandler extends LoadHandler {
+    override def build(stage: Stage, address: UInt, rsp: MemBusRsp): Unit = {
+      import stage._
+      val result = UInt(config.xlen bits)
+      result.assignDontCare()
+
+      val membusAddressLsb = log2Up(config.memBusWidth / 8)
+      val offset = address(membusAddressLsb - 1 downto 0) << 3
+
+      val supportedWidths =
+        LsuAccessWidth.elements.filter(w => LsuAccessWidth.getBitWidth(w) <= config.xlen)
+
+      switch(value(Data.LSU_ACCESS_WIDTH)) {
+        for (w <- supportedWidths) {
+          is(w) {
+            val bitWidth = LsuAccessWidth.getBitWidth(w) bits
+            val rValue = UInt(bitWidth)
+            rValue := rsp.rdata(offset, bitWidth)
+            when(value(Data.LSU_IS_UNSIGNED)) {
+              result := Utils.zeroExtend(rValue, config.xlen)
+            } otherwise {
+              result := Utils.signExtend(rValue, config.xlen)
+            }
+          }
+        }
+      }
+
+      output(pipeline.data.RD_DATA) := result
+      output(pipeline.data.RD_DATA_VALID) := True
+    }
+  }
+
+  private object DefaultStoreHandler extends StoreHandler {
+    override def build(stage: Stage, address: UInt): UInt = {
+      val data = UInt(maxStoreWidth bits)
+      val wValue = stage.value(pipeline.data.RS2_DATA).resized
+      data := wValue
+
+      switch(stage.value(Data.LSU_ACCESS_WIDTH)) {
+        is(LsuAccessWidth.H) {
+          val hValue = wValue(15 downto 0)
+
+          when(address(1)) {
+            data := (hValue << 16).resized
+          } otherwise {
+            data := hValue.resized
+          }
+        }
+        is(LsuAccessWidth.B) {
+          val bValue = wValue(7 downto 0)
+
+          switch(address(1 downto 0).asBits) {
+            is(B"00") {
+              data := bValue.resized
+            }
+            is(B"01") {
+              data := (bValue << 8).resized
+            }
+            is(B"10") {
+              data := (bValue << 16).resized
+            }
+            is(B"11") {
+              data := (bValue << 24).resized
+            }
+          }
+        }
+      }
+      data
+    }
+  }
+
+  private val externalLoadHandlers: LinkedHashSet[LoadHandler] = LinkedHashSet(DefaultLoadHandler)
+  private val externalStoreHandlers: LinkedHashSet[StoreHandler] = LinkedHashSet(
+    DefaultStoreHandler
+  )
+  private var maxStoreWidth = 0
 
   object Data {
     object LSU_OPERATION_TYPE extends PipelineData(LsuOperationType())
     object LSU_ACCESS_WIDTH extends PipelineData(LsuAccessWidth())
     object LSU_IS_UNSIGNED extends PipelineData(Bool())
-    object LSU_IS_EXTERNAL_OP extends PipelineData(Bool())
+    object LSU_EXTERNAL_ADDRESS extends PipelineData(Bool())
     object LSU_TARGET_ADDRESS extends PipelineData(UInt(config.xlen bits)) // TODO: Flow?
     object LSU_TARGET_VALID extends PipelineData(Bool())
     object LSU_STL_SPEC extends PipelineData(Bool())
     object LSU_PSF_ADDRESS extends PipelineData(UInt(config.xlen bits))
     object LSU_PSF_MISSPECULATION extends PipelineData(Bool())
+    object LSU_EXTERNAL_DATA extends PipelineData(Bool())
+    object LSU_LOAD_HANDLER extends PipelineData(UInt(2 bits))
+    object LSU_STORE_HANDLER extends PipelineData(UInt(2 bits))
   }
 
   class DummyFormalService extends FormalService {
@@ -50,7 +133,7 @@ class Lsu(addressStages: Set[Stage], loadStages: Seq[Stage], storeStage: Stage)
         Map(
           Data.LSU_OPERATION_TYPE -> LsuOperationType.STORE,
           Data.LSU_ACCESS_WIDTH -> width,
-          Data.LSU_IS_EXTERNAL_OP -> True,
+          Data.LSU_EXTERNAL_ADDRESS -> True,
           Data.LSU_TARGET_VALID -> False,
           Data.LSU_STL_SPEC -> False
         )
@@ -60,6 +143,30 @@ class Lsu(addressStages: Set[Stage], loadStages: Seq[Stage], storeStage: Stage)
     hasExternalOps = true
 
     pipeline.service[IssueService].setDestinations(opcode, addressStages)
+  }
+
+  override def addStore(
+      opcode: MaskedLiteral,
+      dataHandler: StoreHandler,
+      width: SpinalEnumElement[LsuAccessWidth.type],
+      useExternalAddress: Boolean = false
+  ): Unit = {
+    externalStoreHandlers += dataHandler
+    pipeline.service[DecoderService].configure { config =>
+      config.addDecoding(
+        opcode,
+        Map(
+          Data.LSU_OPERATION_TYPE -> LsuOperationType.STORE,
+          Data.LSU_TARGET_VALID -> False,
+          Data.LSU_EXTERNAL_DATA -> True,
+          Data.LSU_STL_SPEC -> False,
+          Data.LSU_EXTERNAL_ADDRESS -> Bool(useExternalAddress),
+          Data.LSU_ACCESS_WIDTH -> width.craft(),
+          Data.LSU_STORE_HANDLER -> U(externalStoreHandlers.iterator.indexOf(dataHandler))
+        )
+      )
+    }
+    maxStoreWidth = Math.max(LsuAccessWidth.getBitWidth(width), maxStoreWidth)
   }
 
   override def addLoad(
@@ -74,7 +181,7 @@ class Lsu(addressStages: Set[Stage], loadStages: Seq[Stage], storeStage: Stage)
           Data.LSU_OPERATION_TYPE -> LsuOperationType.LOAD,
           Data.LSU_ACCESS_WIDTH -> width,
           Data.LSU_IS_UNSIGNED -> Bool(unsigned),
-          Data.LSU_IS_EXTERNAL_OP -> True,
+          Data.LSU_EXTERNAL_ADDRESS -> True,
           Data.LSU_TARGET_VALID -> False
         )
       )
@@ -85,8 +192,34 @@ class Lsu(addressStages: Set[Stage], loadStages: Seq[Stage], storeStage: Stage)
     pipeline.service[IssueService].setDestinations(opcode, addressStages)
   }
 
+  override def addLoad(
+      opcode: MaskedLiteral,
+      dataHandler: LoadHandler,
+      width: SpinalEnumElement[LsuAccessWidth.type],
+      useExternalAddress: Boolean = false
+  ): Unit = {
+    externalLoadHandlers += dataHandler
+    pipeline.service[DecoderService].configure { config =>
+      config.addDecoding(
+        opcode,
+        Map(
+          Data.LSU_OPERATION_TYPE -> LsuOperationType.LOAD,
+          Data.LSU_TARGET_VALID -> False,
+          Data.LSU_EXTERNAL_DATA -> True,
+          Data.LSU_EXTERNAL_ADDRESS -> Bool(useExternalAddress),
+          Data.LSU_ACCESS_WIDTH -> width.craft(),
+          Data.LSU_LOAD_HANDLER -> U(externalLoadHandlers.iterator.indexOf(dataHandler))
+        )
+      )
+    }
+  }
+
   override def setAddress(address: UInt): Unit = {
     externalAddress := address
+  }
+
+  override def setExternalStoreData(data: UInt): Unit = {
+    externalStoreData := data
   }
 
   override def stage: Stage = addressStages.head // TODO: which one? needed?
@@ -130,6 +263,7 @@ class Lsu(addressStages: Set[Stage], loadStages: Seq[Stage], storeStage: Stage)
   }
 
   override def setup(): Unit = {
+    maxStoreWidth = config.xlen
     for (addressStage <- addressStages) {
       addressStage plug new Area {
         val externalAddress = UInt(config.xlen bits).assignDontCare()
@@ -173,7 +307,10 @@ class Lsu(addressStages: Set[Stage], loadStages: Seq[Stage], storeStage: Stage)
         Map(
           Data.LSU_OPERATION_TYPE -> LsuOperationType.NONE,
           Data.LSU_IS_UNSIGNED -> False,
-          Data.LSU_IS_EXTERNAL_OP -> False
+          Data.LSU_EXTERNAL_ADDRESS -> False,
+          Data.LSU_EXTERNAL_DATA -> False,
+          Data.LSU_LOAD_HANDLER -> U(0),
+          Data.LSU_STORE_HANDLER -> U(0)
         )
       )
 
@@ -245,7 +382,7 @@ class Lsu(addressStages: Set[Stage], loadStages: Seq[Stage], storeStage: Stage)
           // We keep track of whether we have external loads/stores to 1) prevent LSU_IS_EXTERNAL_OP
           // from being added to the pipeline regs and 2) not generate this mux when not necessary
           // (although the latter might be optimized away at some point).
-          value(Data.LSU_IS_EXTERNAL_OP) ? externalAddress | aluResult
+          value(Data.LSU_EXTERNAL_ADDRESS) ? externalAddress | aluResult
         } else {
           aluResult
         }
@@ -264,51 +401,15 @@ class Lsu(addressStages: Set[Stage], loadStages: Seq[Stage], storeStage: Stage)
       }
     }
 
-    def checkAccessWidth(accessWidth: SpinalEnumCraft[LsuAccessWidth.type], address: UInt) = {
+    def checkAccessWidth(
+        accessWidth: SpinalEnumCraft[LsuAccessWidth.type],
+        address: UInt
+    ) = {
       val misaligned = Bool()
       val baseMask = Bits(config.memBusWidth / 8 bits)
-
-      if (config.xlen != 64) {
-        // prevent latch because of missing double access width
-        misaligned := False
-        baseMask := B(0).resized
-      }
-
-      if (config.xlen == 32) {
-        switch(accessWidth) {
-          is(LsuAccessWidth.B) {
-            misaligned := False
-            baseMask := B"0001".resized
-          }
-          is(LsuAccessWidth.H) {
-            misaligned := (address & 1) =/= 0
-            baseMask := B"0011".resized
-          }
-          is(LsuAccessWidth.W) {
-            misaligned := (address & 3) =/= 0
-            baseMask := B"1111".resized
-          }
-        }
-      } else {
-        switch(accessWidth) {
-          is(LsuAccessWidth.B) {
-            misaligned := False
-            baseMask := B"00000001".resized
-          }
-          is(LsuAccessWidth.H) {
-            misaligned := (address & 1) =/= 0
-            baseMask := B"00000011".resized
-          }
-          is(LsuAccessWidth.W) {
-            misaligned := (address & 3) =/= 0
-            baseMask := B"00001111".resized
-          }
-          is(LsuAccessWidth.D) {
-            misaligned := (address & 7) =/= 0
-            baseMask := B"11111111".resized
-          }
-        }
-      }
+      val alignmentMask = LsuAccessWidth.getAlignmentMask(accessWidth).resized
+      misaligned := (address & alignmentMask) =/= 0
+      baseMask := LsuAccessWidth.getByteMask(accessWidth).asBits.resized
 
       (misaligned, baseMask)
     }
@@ -355,8 +456,11 @@ class Lsu(addressStages: Set[Stage], loadStages: Seq[Stage], storeStage: Stage)
 
         val isActive = operation === LsuOperationType.LOAD
 
-        val (misaligned, baseMask) = checkAccessWidth(accessWidth, address)
+        val isExternalData = value(Data.LSU_EXTERNAL_DATA)
+        val (misaligned, baseMask) =
+          checkAccessWidth(accessWidth, address)
 
+        // TODO this becomes wrong for external data
         val mask = baseMask |<< address(1 downto 0)
 
         val busReady = Bool()
@@ -390,64 +494,14 @@ class Lsu(addressStages: Set[Stage], loadStages: Seq[Stage], storeStage: Stage)
               loadActive := False
             }
             arbitration.isReady := valid
-            val result = UInt(config.xlen bits)
-            result := fullValue
 
-            // TODO: this whole switch could be generated from a template
-            switch(value(Data.LSU_ACCESS_WIDTH)) {
-              is(LsuAccessWidth.H) {
-                // TODO: do we have to do this more often? kinda annoying
-                val offset_len = if (config.xlen == 64) 6 else 5
-                val offset = UInt(offset_len bits)
-                if (config.xlen == 64) {
-                  offset := (address(2) ## address(1) ## B"0000").asUInt
-                } else {
-                  offset := (address(1) ## B"0000").asUInt
-                }
-                val hValue = fullValue(offset, 16 bits)
-
-                when(value(Data.LSU_IS_UNSIGNED)) {
-                  result := Utils.zeroExtend(hValue, config.xlen)
-                } otherwise {
-                  result := Utils.signExtend(hValue, config.xlen)
-                }
-              }
-              is(LsuAccessWidth.B) {
-                // TODO: do we have to do this more often? kinda annoying
-                val offset_len = if (config.xlen == 64) 6 else 5
-                val offset = UInt(offset_len bits)
-                if (config.xlen == 64) {
-                  offset := (address(2 downto 0) ## B"000").asUInt
-                } else {
-                  offset := (address(1 downto 0) ## B"000").asUInt
-                }
-                val bValue = fullValue(offset, 8 bits)
-
-                when(value(Data.LSU_IS_UNSIGNED)) {
-                  result := Utils.zeroExtend(bValue, config.xlen)
-                } otherwise {
-                  result := Utils.signExtend(bValue, config.xlen)
+            switch(value(Data.LSU_LOAD_HANDLER)) {
+              for ((handler, idx) <- externalLoadHandlers.zipWithIndex) {
+                is(idx) {
+                  handler.build(loadStage, address, loadDBuses(stageIndex).rsp)
                 }
               }
             }
-
-            if (config.xlen == 64) {
-              when(value(Data.LSU_ACCESS_WIDTH) === LsuAccessWidth.W) {
-                // TODO: do we have to do this more often? kinda annoying
-                val offset = UInt(6 bits)
-                offset := (address(2) ## B"00000").asUInt
-                val wValue = fullValue(offset, 32 bits)
-
-                when(value(Data.LSU_IS_UNSIGNED)) {
-                  result := Utils.zeroExtend(wValue, config.xlen)
-                } otherwise {
-                  result := Utils.signExtend(wValue, config.xlen)
-                }
-              }
-            }
-
-            output(pipeline.data.RD_DATA) := result
-            output(pipeline.data.RD_DATA_VALID) := True
             formal.lsuOnLoad(loadStage, busAddress, mask, fullValue)
           }
         } otherwise {
@@ -459,6 +513,12 @@ class Lsu(addressStages: Set[Stage], loadStages: Seq[Stage], storeStage: Stage)
 
     storeStage plug new Area {
       import storeStage._
+
+      val externalStoreData = UInt(maxStoreWidth bits).assignDontCare()
+      Lsu.this.externalStoreData = externalStoreData
+
+      val metadata = config.dbusConfig.createMetadataBundle.assignDontCare()
+      Lsu.this.storeMetadata = metadata
 
       val storeIndex = loadStages.indexOf(storeStage)
 
@@ -475,7 +535,9 @@ class Lsu(addressStages: Set[Stage], loadStages: Seq[Stage], storeStage: Stage)
 
       val isActive = operation === LsuOperationType.STORE
 
-      val (misaligned, baseMask) = checkAccessWidth(accessWidth, address)
+      val isExternalData = value(Data.LSU_EXTERNAL_DATA)
+      val (misaligned, baseMask) =
+        checkAccessWidth(accessWidth, address)
 
       val addressOffset = log2Up(config.memBusWidth / 8) - 1
 
@@ -491,45 +553,17 @@ class Lsu(addressStages: Set[Stage], loadStages: Seq[Stage], storeStage: Stage)
 
       when(arbitration.isValid && !misaligned) {
         when(isActive) {
-          val wValue = value(pipeline.data.RS2_DATA)
           arbitration.rs2Needed := True
-          val data = UInt(config.xlen bits)
-          data := wValue
-
-          switch(value(Data.LSU_ACCESS_WIDTH)) {
-            is(LsuAccessWidth.H) {
-              val hValue = wValue(15 downto 0)
-
-              when(address(1)) {
-                data := (hValue << 16).resized
-              } otherwise {
-                data := hValue.resized
-              }
-            }
-            is(LsuAccessWidth.B) {
-              val bValue = wValue(7 downto 0)
-
-              switch(address(1 downto 0).asBits) {
-                is(B"00") {
-                  data := bValue.resized
-                }
-                is(B"01") {
-                  data := (bValue << 8).resized
-                }
-                is(B"10") {
-                  data := (bValue << 16).resized
-                }
-                is(B"11") {
-                  data := (bValue << 24).resized
-                }
-              }
-            }
-          }
-
+          val data = UInt(maxStoreWidth bits)
+          data := value(Data.LSU_STORE_HANDLER).muxListDc(
+            externalStoreHandlers.toSeq.zipWithIndex.map(tpl =>
+              (U(tpl._2), tpl._1.build(storeStage, address))
+            )
+          )
           // Position the data within the cache line
           val cacheLine = data << (busAddress(addressOffset downto 0) << 3)
 
-          val accepted = dbusCtrl.write(busAddress, cacheLine.resized, mask)
+          val accepted = dbusCtrl.write(busAddress, cacheLine.resized, mask, metadata)
           arbitration.isReady := accepted
 
           formal.lsuOnStore(storeStage, busAddress, mask, data)

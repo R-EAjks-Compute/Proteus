@@ -4,156 +4,65 @@ import riscv._
 import spinal.core._
 import spinal.lib._
 import spinal.lib.fsm._
+import riscv.plugins.memory.Metadata
+import riscv.plugins.memory.MetadataProvider
 
 // noinspection ForwardReference
 class MemoryTagger(memoryStart: BigInt, memorySize: BigInt)(implicit context: Context)
-    extends Plugin[Pipeline]
-    with TaggedMemoryService {
-  assert(memorySize % (context.clen / 8) == 0)
-  private val numTags = memorySize / (context.clen / 8)
+    extends MetadataProvider {
+  assert(context.config.memBusWidth % context.clen == 0)
+  private val tagBlockSize = context.config.memBusWidth / context.clen
+  assert(memorySize % (context.config.memBusWidth / 8) == 0)
+  private val numTagBlocks = memorySize / (context.config.memBusWidth / 8)
 
-  private var masterCapBus: CapBus = _
-  private var slaveCapBus: CapBus = _
+  case class MemoryTaggerComponent() extends Component {
+    setDefinitionName("MemoryTagger")
+    setName("memorytagger")
+    val io = new Bundle {
+      val address = in UInt (context.config.xlen bits)
+      val wvalid = in Bool ()
+      val write = in Bool ()
+      val wmask = in Bits (context.config.dbusConfig.dataWidth / 8 bits)
+      val wTagBlock = in UInt (tagBlockSize bits)
+      val rvalid = in Bool ()
+      val rTagBlock = out UInt (tagBlockSize bits)
+    }
 
-  override def build(): Unit = {
-    pipeline.service[MemoryService].filterDBus { (stage, dbusIn, dbusOut) =>
-      slaveCapBus = CapBus().setName("cbus")
-      build(stage, dbusIn, slaveCapBus, dbusOut)
+    val tags = Mem(Bits(tagBlockSize bits), wordCount = numTagBlocks)
+
+    io.rTagBlock.assignDontCare()
+    val tagIndex = ((io.address - memoryStart) >> log2Up(tagBlockSize / 8)).resized
+    when(io.wvalid && io.write) {
+      // determine which tags need to be updated in the block
+      val maskRegions = io.wmask.subdivideIn(tagBlockSize slices)
+      val tagWMask = maskRegions.map(m => m.orR).asBits
+      // do masked write into tag memory
+      tags.write(tagIndex, io.wTagBlock.asBits, mask = tagWMask)
+    }
+    when(io.rvalid && !io.write) {
+      io.rTagBlock := tags(tagIndex).asUInt
+    }
+
+    def connectToBus(bus: MemBus): Unit = {
+      io.address := bus.cmd.address
+      io.wvalid := bus.cmd.valid
+      io.write := bus.cmd.write
+      io.wmask := bus.cmd.wmask
+      val cmdTagBlock = bus.cmd.metadata.element(CapabilityTags)
+      io.wTagBlock := cmdTagBlock.asInstanceOf[UInt]
+      io.rvalid := bus.rsp.valid
+      bus.rsp.metadata.element(CapabilityTags) := io.rTagBlock
     }
   }
 
-  def build(stage: Stage, dbusIn: MemBus, cbusIn: CapBus, dbusOut: MemBus): Unit = {
-    pipeline plug new StateMachine {
-      val tags = Mem(Seq.fill(numTags.toInt) { False })
-
-      dbusIn.cmd.ready := False
-      dbusIn.rsp.valid := False
-      dbusIn.rsp.payload.rdata.assignDontCare()
-      val dbusControl = new MemBusControl(dbusOut)
-
-      cbusIn.cmd.ready := False
-      cbusIn.rsp.valid := False
-      cbusIn.rsp.payload.rdata.assignDontCare()
-
-      val address = dbusIn.cmd.valid ? dbusIn.cmd.payload.address | cbusIn.cmd.payload.address
-      val addressInMemory = (address >= memoryStart) && (address < memoryStart + memorySize)
-      val tagIndex = ((address - memoryStart) >> log2Up(context.clen / 8)).resized
-
-      val cbusPayload = cbusIn.cmd.payload
-      val cbusWordCtr = Counter(context.clen / config.xlen)
-      val cbusTag = cbusPayload.wdata.tag
-      val cbusWdata = cbusPayload.wdata.value
-      val cbusWords = cbusWdata.subdivideIn(config.xlen bits)
-      val cbusWord = cbusWords(cbusWordCtr)
-      val cbusWordAddress = cbusPayload.address + (cbusWordCtr << log2Up(config.xlen / 8))
-
-      val cbusReadWords = Vec(Reg(UInt(config.xlen bits)), context.clen / config.xlen - 1)
-
-      val PASS_THROUGH: State = new State with EntryPoint {
-        whenIsActive {
-          when(dbusIn.cmd.valid) {
-            val payload = dbusIn.cmd.payload
-
-            when(payload.write) {
-              val accepted = dbusControl.write(payload.address, payload.wdata, payload.wmask)
-
-              when(accepted) {
-                dbusIn.cmd.ready := True
-
-                when(addressInMemory) {
-                  tags(tagIndex) := False
-                }
-              }
-            } otherwise {
-              val (valid, rdata) = dbusControl.read(payload.address)
-
-              when(valid) {
-                dbusIn.cmd.ready := True
-                dbusIn.rsp.valid := True
-                dbusIn.rsp.payload.rdata := rdata
-              }
-            }
-          } elsewhen (cbusIn.cmd.valid) {
-            when(cbusPayload.write) {
-              val accepted = dbusControl.write(cbusWordAddress, cbusWord, B"1111")
-
-              when(accepted) {
-                cbusWordCtr.increment()
-                goto(CAP_OP)
-              }
-            } otherwise {
-              val (valid, rdata) = dbusControl.read(cbusWordAddress)
-
-              when(valid) {
-                if (cbusReadWords.length == 1) {
-                  cbusReadWords(0) := rdata
-                } else {
-                  cbusReadWords(cbusWordCtr) := rdata
-                }
-                cbusWordCtr.increment()
-                goto(CAP_OP)
-              }
-            }
-          }
-        }
-      }
-
-      val CAP_OP = new State {
-        whenIsActive {
-          when(cbusPayload.write) {
-            val accepted = dbusControl.write(cbusWordAddress, cbusWord, B"1111")
-
-            when(accepted) {
-              when(cbusWordCtr.willOverflowIfInc) {
-                when(addressInMemory) {
-                  tags(tagIndex) := cbusTag
-                }
-
-                cbusIn.cmd.ready := True
-                goto(PASS_THROUGH)
-              }
-
-              cbusWordCtr.increment()
-            }
-          } otherwise {
-            val (valid, rdata) = dbusControl.read(cbusWordAddress)
-
-            when(valid) {
-              when(cbusWordCtr.willOverflowIfInc) {
-                cbusIn.rsp.rdata.assignValue((rdata ## cbusReadWords).asUInt)
-                cbusIn.rsp.rdata.tag := tags(tagIndex)
-                cbusIn.cmd.ready := True
-                cbusIn.rsp.valid := True
-                goto(PASS_THROUGH)
-              } otherwise {
-                if (cbusReadWords.length == 1) {
-                  cbusReadWords(0) := rdata
-                } else {
-                  cbusReadWords(cbusWordCtr) := rdata
-                }
-              }
-
-              cbusWordCtr.increment()
-            }
-          }
-        }
-      }
-    }
+  def build(dbus: MemBus): Component = {
+    val tagger = new MemoryTaggerComponent()
+    tagger.connectToBus(dbus)
+    tagger
   }
 
-  override def finish(): Unit = {
-    pipeline plug {
-      masterCapBus <> slaveCapBus
-    }
-  }
+  override def getKey = CapabilityTags
 
-  override def createCapBus(stage: Stage): CapBus = {
-    assert(masterCapBus == null)
+  override def getHardType = UInt(tagBlockSize bits)
 
-    stage plug {
-      masterCapBus = master(CapBus()).setName("cbus")
-    }
-
-    masterCapBus
-  }
 }

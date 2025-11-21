@@ -69,6 +69,4 @@ trait ExceptionService {
   }
 }
 
-trait TaggedMemoryService {
-  def createCapBus(stage: Stage): CapBus
-}
+object CapabilityTags extends plugins.memory.Metadata
