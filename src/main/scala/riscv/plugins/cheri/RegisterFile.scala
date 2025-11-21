@@ -59,6 +59,15 @@ class RegisterFile(readStage: Stage, writeStage: Stage)(implicit context: Contex
         val regWire = RegCapability()
         regWire.setName(s"c$i")
         regWire := regs.readAsync(U(i).resized, writeFirst)
+
+        if (config.debug) {
+          // in compressed case it is nice to also have the full base and top.
+          val baseWire = regWire.base
+          baseWire.setName(s"c${i}_base")
+
+          val topWire = regWire.top
+          topWire.setName(s"c${i}_top")
+        }
       }
 
       def readReg(addr: UInt) = regs.readAsync(addr, writeFirst)

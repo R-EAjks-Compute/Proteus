@@ -8,6 +8,7 @@ import spinal.lib._
 import spinal.lib.misc.HexTools
 import spinal.lib.bus.amba4.axi._
 import spinal.lib.bus.amba3.apb._
+import riscv.plugins.cheri.MemoryTagger
 
 sealed abstract class RamType(val size: BigInt)
 
@@ -62,6 +63,7 @@ class SoC(
       val memService = pipeline.service[MemoryService]
       val ibus = memService.getExternalIBus
       val dbus = memService.getExternalDBus
+      val metadataProviders = config.dbusMetadataProviders.map(provider => provider.build(dbus))
     }
 
     core.setName("")

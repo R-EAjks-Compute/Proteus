@@ -3,6 +3,7 @@ package riscv.plugins.cheri
 import riscv._
 
 import spinal.core._
+import riscv.BaseIsa.RV32E.xlen
 
 class Access(stage: Stage)(implicit context: Context) extends Plugin[Pipeline] {
   object FieldSelect extends SpinalEnum {
@@ -10,7 +11,8 @@ class Access(stage: Stage)(implicit context: Context) extends Plugin[Pipeline] {
   }
 
   object Modification extends SpinalEnum {
-    val AND_PERM, SET_OFFSET, SET_ADDR, INC_OFFSET, SET_BOUNDS, CLEAR_TAG = newElement()
+    val AND_PERM, SET_OFFSET, SET_ADDR, INC_OFFSET, SET_BOUNDS, SET_BOUNDS_EXACT, CLEAR_TAG =
+      newElement()
   }
 
   object Data {
@@ -62,7 +64,7 @@ class Access(stage: Stage)(implicit context: Context) extends Plugin[Pipeline] {
         (Opcodes.CIncOffset, Modification.INC_OFFSET, InstructionType.R_CRC),
         (Opcodes.CIncOffsetImm, Modification.INC_OFFSET, InstructionType.I_CxC),
         (Opcodes.CSetBounds, Modification.SET_BOUNDS, InstructionType.R_CRC),
-        (Opcodes.CSetBoundsExact, Modification.SET_BOUNDS, InstructionType.R_CRC),
+        (Opcodes.CSetBoundsExact, Modification.SET_BOUNDS_EXACT, InstructionType.R_CRC),
         (Opcodes.CSetBoundsImm, Modification.SET_BOUNDS, InstructionType.I_CxC),
         (Opcodes.CClearTag, Modification.CLEAR_TAG, InstructionType.R_CxC)
       )
@@ -105,15 +107,27 @@ class Access(stage: Stage)(implicit context: Context) extends Plugin[Pipeline] {
           val cap = value(context.data.CS1_DATA)
 
           when(!arbitration.isStalled) {
+            def capMaxAddress(inAddr: UInt): UInt = {
+              val maxAddress = UInt(config.xlen bits).setAll()
+              val retAddr = UInt(config.xlen bits)
+
+              when(inAddr > maxAddress) {
+                retAddr := maxAddress
+              } otherwise {
+                retAddr := inAddr.resize(config.xlen)
+              }
+              retAddr
+            }
+
             val rd = value(Data.CFIELD).mux(
               FieldSelect.PERM -> cap.perms.asIsaBits.asUInt.resized,
               FieldSelect.TYPE -> cap.otype.extendedValue,
               FieldSelect.BASE -> cap.base,
-              FieldSelect.LEN -> cap.length,
+              FieldSelect.LEN -> capMaxAddress(cap.length),
               FieldSelect.TAG -> cap.tag.asUInt.resized,
               FieldSelect.SEALED -> (cap.tag && cap.isSealed).asUInt.resized,
               FieldSelect.OFFSET -> cap.offset,
-              FieldSelect.ADDR -> (cap.base + cap.offset) // TODO: use ALU
+              FieldSelect.ADDR -> cap.address
             )
 
             output(pipeline.data.RD_DATA) := rd
@@ -150,45 +164,50 @@ class Access(stage: Stage)(implicit context: Context) extends Plugin[Pipeline] {
           when(!arbitration.isStalled) {
             switch(value(Data.CMODIFICATION)) {
               is(Modification.AND_PERM) {
-                when(!cs.tag) {
-                  except(ExceptionCause.TagViolation)
-                } otherwise {
-                  val newPerms = cs.perms.asIsaBits & rhs.asBits
-                  cd.perms.assignFromIsaBits(newPerms)
+                when(cs.isSealed) {
+                  cd.tag := False
                 }
+                val newPerms = cs.perms.asIsaBits & rhs.asBits
+                cd.perms.assignFromIsaBits(newPerms)
               }
               is(Modification.SET_OFFSET) {
-                cd.offset := rhs
+                val newAddress = cs.base + rhs // TODO use IntAlu?
+                val representable = cs.fastRepCheck(rhs, True)
+
+                when(!representable || cs.isSealed) {
+                  cd.tag := False
+                }
+                cd.address := newAddress
               }
               is(Modification.SET_ADDR) {
-                when(cs.tag && cs.isSealed) {
-                  except(ExceptionCause.SealViolation)
-                } elsewhen (rhs < cs.base) {
-                  cd.base := rhs
-                  cd.offset := 0
+                val delta = rhs - cs.address
+                // TODO: avoid above subtraction with special repCheck of setAddress in
+                // https://github.com/CTSRD-CHERI/cheri-cap-lib/blob/master/CHERICC_Fat.bsv
+                val representable = cs.fastRepCheck(delta, False)
+                when(!representable || cs.isSealed) {
                   cd.tag := False
-                } otherwise {
-                  val offset = rhs - cs.base
-                  cd.offset := offset
-                  cd.tag := cs.tag && (offset < cs.length)
                 }
+                cd.address := rhs
               }
               is(Modification.INC_OFFSET) {
-                cd.offset := cs.offset + rhs // TODO use IntAlu?
+                val representable = cs.fastRepCheck(rhs, False)
+                when(!representable || cs.isSealed) {
+                  cd.tag := False
+                }
+                cd.address := cs.address + rhs // TODO use IntAlu?
               }
               is(Modification.SET_BOUNDS) {
-                val newTop = cs.address + rhs
-
-                when(!cs.tag) {
-                  except(ExceptionCause.TagViolation)
-                } elsewhen (cs.address < cs.base) {
-                  except(ExceptionCause.LengthViolation)
-                } elsewhen (newTop > cs.top) {
-                  except(ExceptionCause.LengthViolation)
-                } otherwise {
-                  cd.base := cs.address
-                  cd.length := rhs
-                  cd.offset := 0
+                val (_, inBounds, retCap) = cs.setBoundsReturn(rhs)
+                cd := retCap
+                when(!inBounds || cs.isSealed) {
+                  cd.tag := False
+                }
+              }
+              is(Modification.SET_BOUNDS_EXACT) {
+                val (exact, inBounds, retCap) = cs.setBoundsReturn(rhs)
+                cd := retCap
+                when(!(inBounds && exact) || cs.isSealed) {
+                  cd.tag := False
                 }
               }
               is(Modification.CLEAR_TAG) {

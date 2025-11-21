@@ -52,15 +52,17 @@ object createCheriPipeline {
 
     implicit val context = Context(pipeline)
 
+    conf.dbusMetadataProviders =
+      conf.dbusMetadataProviders :+ new MemoryTagger(0x80000000L, memorySize)
+
     pipeline.addPlugins(
       Seq(
         new RegisterFile(pipeline.decode, pipeline.writeback),
         new Access(pipeline.execute),
         new ScrFile(pipeline.writeback),
-        new Lsu(pipeline.memory),
+        new Lsu(Set(pipeline.memory), Seq(pipeline.memory), pipeline.memory),
         new ExceptionHandler,
         new Ccsr,
-        new MemoryTagger(0x80000000L, memorySize),
         new PccManager(pipeline.execute),
         new Sealing(pipeline.execute),
         new MachineMode

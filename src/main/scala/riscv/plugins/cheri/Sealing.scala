@@ -68,33 +68,24 @@ class Sealing(stage: Stage)(implicit context: Context) extends Plugin[Pipeline] 
         arbitration.rs2Needed := True
 
         when(!arbitration.isStalled) {
-          // Exception priority
-          // https://www.cl.cam.ac.uk/techreports/UCAM-CL-TR-951.pdf Table 3.4 p. 110
-          when(!cs1.tag) {
-            except(ExceptionCause.TagViolation, cs1Idx)
-          } elsewhen (!cs2.tag) {
-            except(ExceptionCause.TagViolation, cs2Idx)
-          } elsewhen (cs1.isSealed) {
-            except(ExceptionCause.SealViolation, cs1Idx)
-          } elsewhen (cs2.isSealed) {
-            except(ExceptionCause.SealViolation, cs2Idx)
-          } elsewhen (!cs2.perms.seal) {
-            except(ExceptionCause.PermitSealViolation, cs2Idx)
-          } elsewhen (cs2Address < cs2.base) {
-            except(ExceptionCause.LengthViolation, cs2Idx)
-          } elsewhen (cs2Address >= cs2.top) {
-            except(ExceptionCause.LengthViolation, cs2Idx)
-          } elsewhen (cs2Address > context.maxOtype) {
-            except(ExceptionCause.LengthViolation, cs2Idx)
-          } otherwise {
-            val cd = PackedCapability()
-            cd.assignFrom(cs1)
-            cd.otype.value.allowOverride
-            cd.otype.value := cs2Address.resized
+          val cd = PackedCapability()
+          cd.assignFrom(cs1)
+          cd.otype.value.allowOverride
+          cd.otype.value := cs2Address.resized
 
-            output(context.data.CD_DATA).assignFrom(cd)
-            output(pipeline.data.RD_DATA_VALID) := True
+          val permitted = cs2.tag &
+            !cs1.isSealed &
+            !cs2.isSealed &
+            cs2.perms.seal &
+            (cs2Address >= cs2.base) &
+            (cs2Address < cs2.top) &
+            (cs2Address <= context.maxOtype)
+          when(!permitted) {
+            cd.tag := False
           }
+
+          output(context.data.CD_DATA).assignFrom(cd)
+          output(pipeline.data.RD_DATA_VALID) := True
         }
       }
 
@@ -103,33 +94,53 @@ class Sealing(stage: Stage)(implicit context: Context) extends Plugin[Pipeline] 
         arbitration.rs2Needed := True
 
         when(!arbitration.isStalled) {
-          // Exception priority
-          // https://www.cl.cam.ac.uk/techreports/UCAM-CL-TR-951.pdf Table 3.4 p. 110
-          when(!cs1.tag) {
-            except(ExceptionCause.TagViolation, cs1Idx)
-          } elsewhen (!cs2.tag) {
-            except(ExceptionCause.TagViolation, cs2Idx)
-          } elsewhen (!cs1.isSealed) {
-            except(ExceptionCause.SealViolation, cs1Idx)
-          } elsewhen (cs2.isSealed) {
-            except(ExceptionCause.SealViolation, cs2Idx)
-          } elsewhen (cs2Address =/= cs1.otype.value) {
-            except(ExceptionCause.TypeViolation, cs2Idx)
-          } elsewhen (!cs2.perms.unseal) {
-            except(ExceptionCause.PermitUnsealViolation, cs2Idx)
-          } elsewhen (cs2Address < cs2.base) {
-            except(ExceptionCause.LengthViolation, cs2Idx)
-          } elsewhen (cs2Address >= cs2.top) {
-            except(ExceptionCause.LengthViolation, cs2Idx)
-          } otherwise {
-            val cd = PackedCapability()
-            cd.assignFrom(cs1)
-            cd.otype.value.allowOverride
-            cd.otype.unseal()
+          // // Exception priority
+          // // https://www.cl.cam.ac.uk/techreports/UCAM-CL-TR-951.pdf Table 3.4 p. 110
+          // when(!cs1.tag) {
+          //   except(ExceptionCause.TagViolation, cs1Idx)
+          // } elsewhen (!cs2.tag) {
+          //   except(ExceptionCause.TagViolation, cs2Idx)
+          // } elsewhen (!cs1.isSealed) {
+          //   except(ExceptionCause.SealViolation, cs1Idx)
+          // } elsewhen (cs2.isSealed) {
+          //   except(ExceptionCause.SealViolation, cs2Idx)
+          // } elsewhen (cs2Address =/= cs1.otype.value) {
+          //   except(ExceptionCause.TypeViolation, cs2Idx)
+          // } elsewhen (!cs2.perms.unseal) {
+          //   except(ExceptionCause.PermitUnsealViolation, cs2Idx)
+          // } elsewhen (cs2Address < cs2.base) {
+          //   except(ExceptionCause.LengthViolation, cs2Idx)
+          // } elsewhen (cs2Address >= cs2.top) {
+          //   except(ExceptionCause.LengthViolation, cs2Idx)
+          // } otherwise {
+          //   val cd = PackedCapability()
+          //   cd.assignFrom(cs1)
+          //   cd.otype.value.allowOverride
+          //   cd.otype.unseal()
 
-            output(context.data.CD_DATA).assignFrom(cd)
-            output(pipeline.data.RD_DATA_VALID) := True
+          //   output(context.data.CD_DATA).assignFrom(cd)
+          //   output(pipeline.data.RD_DATA_VALID) := True
+          // }
+
+          val cd = PackedCapability()
+          cd.assignFrom(cs1)
+          cd.otype.value.allowOverride
+          cd.otype.unseal()
+
+          val permitted = cs2.tag &
+            cs1.isSealed &
+            !cs2.isSealed &
+            !cs1.hasReservedOType &
+            (cs2Address === cs1.otype.value) &
+            cs2.perms.unseal &
+            (cs2Address >= cs2.base) &
+            (cs2Address < cs2.top)
+          when(!permitted) {
+            cd.tag := False
           }
+
+          output(context.data.CD_DATA).assignFrom(cd)
+          output(pipeline.data.RD_DATA_VALID) := True
         }
       }
 
@@ -139,7 +150,6 @@ class Sealing(stage: Stage)(implicit context: Context) extends Plugin[Pipeline] 
 
         when(!arbitration.isStalled) {
           val target = cs1.address
-          target.lsb := False
 
           // Exception priority
           // https://www.cl.cam.ac.uk/techreports/UCAM-CL-TR-951.pdf Table 3.4 p. 110
@@ -168,6 +178,7 @@ class Sealing(stage: Stage)(implicit context: Context) extends Plugin[Pipeline] 
           } otherwise {
             val targetPcc = PackedCapability()
             targetPcc.assignFrom(cs1)
+            targetPcc.address.lsb := False
             targetPcc.otype.value.allowOverride
             targetPcc.otype.unseal()
             pipeline.service[PccService].jump(stage, targetPcc, cs1Idx)
