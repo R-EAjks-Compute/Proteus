@@ -85,7 +85,11 @@ class MemoryTagger(memoryStart: BigInt, memorySize: BigInt)(implicit context: Co
               val (valid, rdata) = dbusControl.read(cbusWordAddress)
 
               when(valid) {
-                cbusReadWords(cbusWordCtr) := rdata
+                if (cbusReadWords.length == 1) {
+                  cbusReadWords(0) := rdata
+                } else {
+                  cbusReadWords(cbusWordCtr) := rdata
+                }
                 cbusWordCtr.increment()
                 goto(CAP_OP)
               }
@@ -122,7 +126,11 @@ class MemoryTagger(memoryStart: BigInt, memorySize: BigInt)(implicit context: Co
                 cbusIn.rsp.valid := True
                 goto(PASS_THROUGH)
               } otherwise {
-                cbusReadWords(cbusWordCtr) := rdata
+                if (cbusReadWords.length == 1) {
+                  cbusReadWords(0) := rdata
+                } else {
+                  cbusReadWords(cbusWordCtr) := rdata
+                }
               }
 
               cbusWordCtr.increment()

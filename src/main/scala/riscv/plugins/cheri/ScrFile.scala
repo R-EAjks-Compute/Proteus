@@ -51,13 +51,13 @@ class ScrFile(scrStage: Stage)(implicit context: Context) extends Plugin[Pipelin
 
     val scrArea = scrFile plug new Area {
       val io = slave(new CapOffsetIo).setPartialName(ioName)
-      io.rdata := pluggedScr.read().offset
+      io.rdata := pluggedScr.read().address
 
       when(io.write) {
         val newCap = PackedCapability()
         newCap.assignFrom(pluggedScr.read())
-        newCap.offset.allowOverride
-        newCap.offset := io.wdata
+        newCap.address.allowOverride
+        newCap.address := io.wdata
         pluggedScr.write(newCap)
       }
     }

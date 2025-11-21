@@ -9,7 +9,7 @@ import scala.collection.mutable
 class PccManager(branchStage: Stage)(implicit context: Context)
     extends Plugin[StaticPipeline]
     with PccService {
-  private class PccData extends PackedCapability(hasOffset = false)
+  private class PccData extends PackedCapability()
   private object PccData {
     def apply(): PccData = new PccData
     def Root: PccData = PccData().assignRoot()
@@ -73,7 +73,7 @@ class PccManager(branchStage: Stage)(implicit context: Context)
   override def getPcc(stage: Stage): Capability = {
     val pcc = PackedCapability()
     pcc.assignFrom(getCurrentPcc(stage))
-    pcc.offset := stage.input(pipeline.data.PC)
+    pcc.address.allowOverride := stage.input(pipeline.data.PC)
     pcc
   }
 
@@ -81,7 +81,7 @@ class PccManager(branchStage: Stage)(implicit context: Context)
     setTargetPcc(stage, pcc, capIdx)
 
     val pc = UInt(config.xlen bits)
-    pc := pcc.offset
+    pc := pcc.address
     pc.lsb := False
     pipeline.service[JumpService].jump(stage, pc)
   }
@@ -95,7 +95,7 @@ class PccManager(branchStage: Stage)(implicit context: Context)
       )
 
       config.addDecoding(
-        Opcodes.CJALR,
+        Opcodes.JALR_CAP,
         InstructionType.R_CxC,
         Map(
           Data.CJALR -> True
@@ -131,12 +131,12 @@ class PccManager(branchStage: Stage)(implicit context: Context)
     }
 
     // Checking permissions on PCC is done at two locations.
-    // 1) While fetching instructions (combined with offsetting PC via PCC).
+    // 1) While fetching instructions
     // This will catch PCC violations caused by normal (non-jump) PC updates.
     pipeline.service[FetchService] setAddressTranslator new FetchAddressTranslator {
       override def translate(stage: Stage, address: UInt): UInt = {
         val pcc = getCurrentPcc(stage)
-        val fetchAddress = pcc.base + address
+        val fetchAddress = address
         checkJumpTarget(stage, fetchAddress)
         fetchAddress
       }
@@ -149,7 +149,7 @@ class PccManager(branchStage: Stage)(implicit context: Context)
         // make more sense to fault the jump instruction instead of the target.
         case JumpType.Normal => {
           val pccInfo = getTargetPcc(stage)
-          checkJumpTarget(stage, pccInfo.value.base + nextPc)
+          checkJumpTarget(stage, nextPc)
         }
         // No permission checks are done on traps since the new trap would fail
         // again for the same reason. There seem to be two ways of handling
@@ -210,7 +210,7 @@ class PccManager(branchStage: Stage)(implicit context: Context)
 
           val cd = PackedCapability()
           cd.assignFrom(getCurrentPcc(branchStage))
-          cd.offset := input(pipeline.data.NEXT_PC)
+          cd.address.allowOverride := input(pipeline.data.NEXT_PC)
           output(context.data.CD_DATA).assignFrom(cd)
           output(pipeline.data.RD_DATA_VALID) := True
         }
@@ -222,12 +222,24 @@ class PccManager(branchStage: Stage)(implicit context: Context)
       // difficult to interpret the waveform when PCC.base != 0. ABS_PC to the rescue!
       object ABS_PC extends PipelineData(UInt(config.xlen bits))
 
+      // In compressed case would be nice to also have full base and top:
+      object PCC_base extends PipelineData(UInt(config.xlen bits))
+      object PCC_top extends PipelineData(UInt(config.xlen + 1 bits))
+
       pipeline.fetchStage plug {
         pipeline.fetchStage.output(ABS_PC) := getPcc(pipeline.fetchStage).address
+
+        pipeline.fetchStage.output(PCC_base) := getPcc(pipeline.fetchStage).base
+        pipeline.fetchStage.output(PCC_top) := getPcc(pipeline.fetchStage).top
       }
 
       // This forces ABS_PC to be propagated through the whole pipeline.
-      pipeline.retirementStage.output(ABS_PC)
+      pipeline.retirementStage.output(
+        ABS_PC
+      ) // in cheri v9 this is obsolete, pc is the absolute pc because no relocation
+
+      pipeline.retirementStage.output(PCC_base)
+      pipeline.retirementStage.output(PCC_top)
     }
   }
 }

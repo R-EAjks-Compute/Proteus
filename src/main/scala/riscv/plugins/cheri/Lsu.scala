@@ -88,7 +88,8 @@ class Lsu(stage: Stage)(implicit context: Context) extends Plugin[Pipeline] {
         // When USE_CAP_ADDR is set, checks are done in build
         when(!stage.value(Data.USE_CAP_ADDR)) {
           val ddc = pipeline.service[ScrService].getDdc(stage)
-          result := ddc.address + address
+          // result := ddc.address + address
+          result := address // cheri v9 does not relocate legacy memory access using pointers
 
           val byteWidth = width.mux(
             LsuAccessWidth.B -> U(1),
